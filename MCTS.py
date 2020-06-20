@@ -8,7 +8,8 @@ import time
 import re
 import random
 from multiprocessing import Process, Value
-
+import faulthandler
+import matplotlib.pyplot as plt
 
 class Tree():
 	''' 
@@ -26,12 +27,14 @@ class Tree():
 		How should new nodes be added
 	'''
 
-	def __init__(self, seed, brancher, adding_new_nodes='all'):
+	def __init__(self, seed, brancher, adding_new_nodes='all', branches_per_lp_solve=5):
 		''' 
 		Only starts with root node.
 		'''
-		super().__init__()
 
+		self.brancher = brancher
+
+		self.branches_per_lp_solve = branches_per_lp_solve
 
 		self.nodes = []
 
@@ -59,6 +62,14 @@ class Tree():
 		self.rollout_parent_index = []
 		self.rollout_node_cands = []
 
+		self.best_sol_list = []
+		self.nb_dom_ch_list = []
+
+		self.curr_best_sol = 1e8
+
+		self.ndomchgs = 0
+		self.ndomchgs_graph = 0
+
 
 
 	def get_best_sol(self):
@@ -66,13 +77,6 @@ class Tree():
 		Returns best solution from tree
 		'''
 		return self.nodes[0].best_lp_sol
-
-
-	def branchinitsol(self):
-		self.ndomchgs = 0
-		self.ncutoffs = 0
-		self.state_buffer = {}
-		self.khalil_root_buffer = {}
 
 
 	def add_all_nodes(self):
@@ -86,7 +90,7 @@ class Tree():
 		''' 
 		Adds a new node at the node where best dive was
 		'''
-		max_val = max(self.rollout_sols)
+		max_val = min(self.rollout_sols)
 		max_idx = self.rollout_sols.tolist().index(max_val)
 		node = self.rollout_tree_nodes[max_idx]
 		scip_node = self.rollout_scip_nodes[max_idx]
@@ -160,6 +164,8 @@ class Tree():
 		# Only increment if we are not at root
 		if parent_node.parent is not None:
 			increment_to_root(parent_node, wins, sol)
+		else:
+			parent_node.update_best_sol(sol)
 
 
 
@@ -233,10 +239,21 @@ class Node():
 		return (self.nb_visits, self.nb_wins)
 
 
+	def get_best_sol(self):
+		'''
+		Gets best feasible solution
+		'''
+		return nodes[0].best_lp_sol
+
+
 	def update_ucb(self, exp_ratio=np.sqrt(2)):
 		'''
 		Calculate upper confidence bound
 		'''
+		# print(self.nb_visits)
+		# print(list(self.child_nb_wins)[:20])
+		# print(list(self.child_nb_visits)[:20])
+		# print("\n\n\n")
 		if self.nb_visits == 1:
 			self.child_ucb = (self.child_nb_wins / self.child_nb_visits) + \
 								exp_ratio * np.sqrt(self.nb_visits/self.child_nb_visits)		
@@ -281,17 +298,6 @@ class Node():
 		return cand, direction, max_ind
 
 
-	def choose_children(self):
-		'''
-		Choose children based on UCT score
-		Returns both the children and the direction of branching
-		'''
-		cand_ind = np.argmax([cand.ucb_score for cand in self.children])
-		cand = self.children[cand_ind]
-		direction = cand.branch_up
-		return cand, direction
-
-
 	def set_cands(self, cands):
 		''' 
 		Sets a list of candidates for node
@@ -331,11 +337,9 @@ class PolicyBranching(scip.Branchrule):
 			self.policy = policy['name']
 
 	def branchinitsol(self):
-		self.ndomchgs = 0
 		self.ncutoffs = 0
 		self.state_buffer = {}
 		self.khalil_root_buffer = {}
-
 
 	def add_tree(self, mcts_tree):
 		# When tree is initialized, add it to brancher
@@ -345,7 +349,9 @@ class PolicyBranching(scip.Branchrule):
 	def branchexeclp(self, allowaddcons):
 		candidate_vars, *_ = self.model.getPseudoBranchCands()
 
-		print(self.mcts_tree.nodes)
+		# print(len(candidate_vars))
+
+		# print(self.mcts_tree.nodes)
 
 		# print(self.mcts_tree.phase)
 
@@ -369,6 +375,7 @@ class PolicyBranching(scip.Branchrule):
 		if self.mcts_tree.phase == 'rollout':
 			# Need to get to leaf before we dive
 			# Here leaf means the node does not have any dives performed on it
+			# print("ROLLOUT")
 			while not self.mcts_tree.curr_node.is_leaf():
 				cand, direction, node_ind = self.mcts_tree.curr_node.choose_candidate()
 				self.mcts_tree.update_focus_node(cand, node_ind)
@@ -381,7 +388,6 @@ class PolicyBranching(scip.Branchrule):
 					lb = cand.getLbLocal()	
 					self.model.tightenVarUb(cand, lb)
 
-
 			result = scip.SCIP_RESULT.REDUCEDDOM
 				
 			# Dive when we get to leaf node
@@ -393,47 +399,74 @@ class PolicyBranching(scip.Branchrule):
 
 			start_var = self.mcts_tree.start_var
 			# print(start_var)
-
+			# print("In dive")
 			# Diving
 			# Will never be false, however fct will not be called when optimal
 			if self.model.getStatus() == 'unknown':
-				if start_var:
-					cand, direction, node_ind = self.mcts_tree.curr_node.choose_candidate()
-					self.mcts_tree.rollout_parent_index.append(node_ind)
-					self.mcts_tree.rollout_node_cands.append(candidate_vars)
-					self.mcts_tree.curr_node = Node(self.mcts_tree.curr_node, cand, node_ind, direction)
-				else:
-					cand = candidate_vars[0]
+				# Branching n times before solving LP
+				for i in range(self.mcts_tree.branches_per_lp_solve):
+					# print(i)
+					if start_var:
+						cand, direction, node_ind = self.mcts_tree.curr_node.choose_candidate()
+						self.mcts_tree.rollout_parent_index.append(node_ind)
+						self.mcts_tree.rollout_node_cands.append(candidate_vars)
+						self.mcts_tree.curr_node = Node(self.mcts_tree.curr_node, cand, node_ind, direction)
+					else:
+						cand = candidate_vars[i]
 					
-				lb = cand.getLbLocal()
-				ub = cand.getUbLocal()
+					# print(cand in candidate_vars)
 
-				if start_var:
-					# Branch up
-					if direction == 0:
-						self.model.tightenVarUb(cand, lb)
-						# self.model.branchVarUp(cand)
-					else:
-						self.model.tightenVarLb(cand, ub)
-						# self.model.branchVarDown(cand)
-					self.mcts_tree.start_var = False
-				else:
-					if random.random() > 0.5:
-						# Change upper or lower bound so that ub == lb
-						self.model.tightenVarLb(cand, ub)
-						# self.model.branchVarUp(cand)
-					else:
-						self.model.tightenVarUb(cand, lb)
-						# self.model.branchVarDown(cand)
+					lb = cand.getLbLocal()
+					ub = cand.getUbLocal()
+					# print(dir(cand))
+					# print(cand.getCol())
+					# print(ub, lb, start_var)
 
+					if start_var:
+						# Branch up
+						if direction == 0:
+							self.model.tightenVarUb(cand, lb)
+							# self.model.branchVarUp(cand)
+						else:
+							self.model.tightenVarLb(cand, ub)
+							# self.model.branchVarDown(cand)
+						# print("VAR BRANCHED")
+						self.mcts_tree.start_var = False
+						start_var = False
+					else:
+						if random.random() > 0.5:
+							# Change upper or lower bound so that ub == lb
+							self.model.tightenVarLb(cand, ub)
+							# self.model.branchVarUp(cand)
+						else:
+							self.model.tightenVarUb(cand, lb)
+							# self.model.branchVarDown(cand)
+
+				# print("END DIVE")
+				# print("")
 				result = scip.SCIP_RESULT.REDUCEDDOM
 
+			else:
+				print("MODEL STATUS NOT UNKNOWN")
+
+		if result == scip.SCIP_RESULT.REDUCEDDOM:
+			self.mcts_tree.ndomchgs += 1
+			self.mcts_tree.ndomchgs_graph += 1
+
+		# self.model.createSol()
+		# print(a)
 
 		return {'result': result}
 
 
+# def graph(sols, domchgs):
+# 	'''
+# 	Graphs the best solution at each domaine change
+# 	'''
 
-def tree_search(tree):
+
+
+def tree_search(tree, instance_file):
 	'''
 	Performs MCTS with time limit (seconds)
 	'''
@@ -441,11 +474,34 @@ def tree_search(tree):
 
 	global m
 
-	while True:
-		# if tree.brancher
+	# print(dir(m))
+	# print(a)
 
+	graph_sols = True
+	graph_root_ucb = False
+
+	# GRAPHING
+	plt.ion()
+	plt.show()
+	if graph_sols:
+		plt.xlabel("Nb domain changes")
+		plt.ylabel("Feasible solution")
+	elif graph_root_ucb:
+		plt.xlabel("UCB value")
+		plt.ylabel("Root candidate")		
+
+	while True:
 		# Rollout + dive
 		m.optimize()
+		# print("OPTIMIZED")
+
+		# print(dir(m))
+
+		# If already optimized
+		if not tree.scip_has_branched:
+			print("Problem already optimized")
+			print(m.getObjVal())
+			break
 
 		tree.rollout_tree_nodes.append(tree.curr_node)
 		tree.rollout_scip_nodes.append(tree.curr_node.scip_node)
@@ -453,12 +509,44 @@ def tree_search(tree):
 		# Initiate solution
 		sol = None
 
+		# print("NODES: ",tree.nodes)
+
 		# print(m.getObjVal())
 
 		# I feasible, add sol to list
 		if m.getStatus() == 'optimal':
 			sol = m.getObjVal()
+			# print(m.getSols())
+			# print(m.getSolObjVal(m.getSols()[-1]))
+			# print("SOL: ",sol)
 			tree.rollout_sols[tree.rollout_nb-1] = sol
+			if sol < tree.curr_best_sol:
+				# Add sol and brancher nb to list for graph
+				tree.best_sol_list.append(sol)
+				tree.nb_dom_ch_list.append(tree.ndomchgs)
+
+				tree.curr_best_sol = sol
+		else:
+			print("NOT OPTIMAL")
+
+
+		# GRAPHING SOL VS DOM CHANGES
+		if graph_sols: 
+			if tree.ndomchgs_graph > 500:
+				plt.plot(tree.nb_dom_ch_list, tree.best_sol_list, 'red')
+				plt.draw()
+				plt.pause(0.001)
+
+				tree.ndomchgs_graph = 0
+		# GRAPHING ROOT CHILD UCB
+		elif graph_root_ucb:
+			if random.random() > 0.001:
+				plt.bar(list(range(len(tree.nodes[0].child_ucb))), tree.nodes[0].child_ucb, color='red')
+				plt.draw()
+				plt.pause(0.001)
+
+
+		# print("NB BRANCHES",tree.ndomchgs_graph)
 
 		# Increment nb of runs
 		tree.increment_to_root(node=tree.curr_node, sol=sol)
@@ -479,10 +567,11 @@ def tree_search(tree):
 			elif tree.adding_new_nodes == 'random':
 				tree.add_rand_node()		
 
-			best_sol = max(tree.rollout_sols)
+			best_sol = min(tree.rollout_sols)
+			print(tree.rollout_sols, tree.get_best_sol())
 			best_node = tree.rollout_tree_nodes[tree.rollout_sols.tolist().index(best_sol)]
 			tree.increment_to_root(best_node, wins=True, sol=best_sol)
-
+			# print(list(tree.nodes[0].child_ucb)[:20])
 			# Reset lists
 			tree.rollout_sols = np.ones(tree.max_rollout_nb) * np.inf
 			tree.rollout_scip_nodes = []
@@ -492,9 +581,25 @@ def tree_search(tree):
 		else:
 			tree.rollout_nb += 1
 		
-		print(m.getObjVal())
+		# print(m.getNLPs())
 
-		m.freeTransform()
+		# m.freeTransform()
+
+		# Restart problem
+		start = time.time()
+		m.freeProb()
+
+		m.readProblem(f"{instance_file}")
+
+		utilities.init_scip_params(m, seed=seed, heuristics=False, presolving=False, separating=False, conflict=False)
+
+		m.setIntParam('timing/clocktype', 1)  # 1: CPU user seconds, 2: wall clock time
+		m.setRealParam('limits/time', time_limit)
+
+		end = time.time()
+		# print(f"RESTART TIME: {end-start}")
+
+		# m.freeSol(m.getSols()[0])
 		# print("RESET MODEL")
 
 		tree.curr_node = tree.nodes[0]
@@ -506,7 +611,7 @@ def tree_search(tree):
 if __name__ == '__main__':
 	instance_file = sys.argv[1]
 	seed = 1
-	time_limit = 20
+	time_limit = 1200
 	episode = 1
 
 	# result_file = f"{args.problem}_{time.strftime('%Y%m%d-%H%M%S')}.csv"
@@ -519,13 +624,12 @@ if __name__ == '__main__':
 	brancher = PolicyBranching(policy)
 	mcts_tree = Tree(branching_policies[0]['seed'], brancher)
 	
-
-
 	brancher.add_tree(mcts_tree)
 
 	# Model will be initialized
 	m = scip.Model()
 	m.setIntParam('display/verblevel', 0)
+
 	m.readProblem(f"{instance_file}")
 
 	utilities.init_scip_params(m, seed=seed, heuristics=False, presolving=False, separating=False, conflict=False)
@@ -539,38 +643,47 @@ if __name__ == '__main__':
 		desc=f"Custom PySCIPOpt branching policy.",
 		priority=666666, maxdepth=-1, maxbounddist=1)
 
+	# print(dir(m))
+	# m.printVersion()
+
+	
 
 	# Start 
-	p = Process(target=tree_search, args=(mcts_tree,))
-	p.start()
-	p.join(timeout=time_limit)
+	# p = Process(target=tree_search, args=(mcts_tree,))
+	# p.start()
+	# p.join(timeout=time_limit)
 
-	p.terminate()
+	tree_search(mcts_tree, instance_file)
+
+	# p.terminate()
+	# print(m.data)
 
 
-	stime = m.getSolvingTime()
-	nnodes = m.getNNodes()
-	nlps = m.getNLPs()
-	gap = m.getGap()
-	status = m.getStatus()
-	ndomchgs = brancher.ndomchgs
-	ncutoffs = brancher.ncutoffs
 
-	writer.writerow({
-             'policy': f"{policy['type']}:{policy['name']}",
-             'seed': policy['seed'],
-             'type': instance['type'],
-             'instance': instance,
-             'nnodes': nnodes,
-             'nlps': nlps,
-             'stime': stime,
-             'gap': gap,
-             'status': status,
-             'ndomchgs': ndomchgs,
-             'ncutoffs': ncutoffs,
-             'walltime': walltime,
-             'proctime': proctime,
-	})
+
+	# stime = m.getSolvingTime()
+	# nnodes = m.getNNodes()
+	# nlps = m.getNLPs()
+	# gap = m.getGap()
+	# status = m.getStatus()
+	# ndomchgs = brancher.ndomchgs
+	# ncutoffs = brancher.ncutoffs
+
+	# writer.writerow({
+ #             'policy': f"{policy['type']}:{policy['name']}",
+ #             'seed': policy['seed'],
+ #             'type': instance['type'],
+ #             'instance': instance,
+ #             'nnodes': nnodes,
+ #             'nlps': nlps,
+ #             'stime': stime,
+ #             'gap': gap,
+ #             'status': status,
+ #             'ndomchgs': ndomchgs,
+ #             'ncutoffs': ncutoffs,
+ #             'walltime': walltime,
+ #             'proctime': proctime,
+	# })
 
 
 
