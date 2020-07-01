@@ -7,9 +7,10 @@ import numpy as np
 import time
 import re
 import random
-from multiprocessing import Process, Value
+from multiprocessing import Process, Value, Manager
 import faulthandler
 import matplotlib.pyplot as plt
+from copy import copy, deepcopy
 
 class Tree():
 	''' 
@@ -27,7 +28,7 @@ class Tree():
 		How should new nodes be added
 	'''
 
-	def __init__(self, seed, brancher, adding_new_nodes='all', branches_per_lp_solve=5):
+	def __init__(self, seed, brancher, adding_new_nodes='all', branches_per_lp_solve=5, exp_ratio=np.sqrt(2) ):
 		''' 
 		Only starts with root node.
 		'''
@@ -63,13 +64,16 @@ class Tree():
 		self.rollout_node_cands = []
 
 		self.best_sol_list = []
-		self.nb_dom_ch_list = []
+		self.nb_lp_solves = []
 
 		self.curr_best_sol = 1e8
 
 		self.ndomchgs = 0
 		self.ndomchgs_graph = 0
 
+		self.update_graph = True
+
+		self.exp_ratio = exp_ratio
 
 
 	def get_best_sol(self):
@@ -126,7 +130,7 @@ class Tree():
 
 		parent.children.append(child)
 
-		self.nodes.append(child)
+		# self.nodes.append(child)
 
 
 	def update_focus_node(self, cand, node_ind):
@@ -159,14 +163,29 @@ class Tree():
 			parent_node.child_nb_visits[node_index] += 1
 			parent_node.nb_visits += 1
 
-		parent_node.update_ucb()
+		parent_node.update_ucb(self.exp_ratio)
 
 		# Only increment if we are not at root
 		if parent_node.parent is not None:
 			increment_to_root(parent_node, wins, sol)
-		else:
+		# If parent is root
+		elif sol is not None:
+
 			parent_node.update_best_sol(sol)
 
+
+	def get_graph_vals(self):
+		'''
+		Returns list of best feasible sols found and list of corresponding nb lp solves
+		'''
+		return self.best_sol_list, self.nb_lp_solves
+
+
+	def get_root_ucb(self):
+		'''
+		Returns a list of root node ucb stats
+		'''
+		return self.nodes[0].child_ucb
 
 
 class Node():
@@ -232,13 +251,6 @@ class Node():
 		return self.parent
 
 
-	def get_stats(self):
-		'''
-		Returns node UCB stats in the form of a tuple (runs, wins)
-		'''
-		return (self.nb_visits, self.nb_wins)
-
-
 	def get_best_sol(self):
 		'''
 		Gets best feasible solution
@@ -295,6 +307,12 @@ class Node():
 		cand = self.candidates[max_ind]
 		direction = max_ind % 2
 
+		# print("IN CHOOSE FCT")
+		# print(max_val)
+		# print(max_ind)
+		# print(self.candidates)
+		# print(f"maxval:{max_val}, max_ind:{max_ind}, cand:{cand}")
+
 		return cand, direction, max_ind
 
 
@@ -345,6 +363,15 @@ class PolicyBranching(scip.Branchrule):
 		# When tree is initialized, add it to brancher
 		self.mcts_tree = mcts_tree
 
+	def find_obj_by_attr(self, obj_list, attr):
+		''' Finds the object which name matches in object list'''
+		obj = None
+		for x in obj_list:
+			if x.name == attr:
+				obj = x
+				break
+
+		return obj 
 
 	def branchexeclp(self, allowaddcons):
 		candidate_vars, *_ = self.model.getPseudoBranchCands()
@@ -352,8 +379,8 @@ class PolicyBranching(scip.Branchrule):
 		# print(len(candidate_vars))
 
 		# print(self.mcts_tree.nodes)
-
-		# print(self.mcts_tree.phase)
+		# print("")
+		# print("PHASE: ",self.mcts_tree.phase)
 
 		if not self.mcts_tree.scip_has_branched:
 			self.mcts_tree.scip_has_branched = True
@@ -363,7 +390,7 @@ class PolicyBranching(scip.Branchrule):
 			self.mcts_tree.root_lp_sol = self.model.getObjVal()
 
 			node = Node(None)
-			node.set_cands(candidate_vars)
+			node.set_cands([x.name for x in candidate_vars])
 			node.set_ucb_stats()
 
 			self.mcts_tree.curr_node = node
@@ -371,6 +398,13 @@ class PolicyBranching(scip.Branchrule):
 			self.mcts_tree.nodes.append(node)
 
 			self.mcts_tree.phase = 'dive'
+
+		# print(self.mcts_tree.nodes)
+		# print(self.mcts_tree.curr_node)
+		# print(self.mcts_tree.curr_node.__dict__)
+		# print(self.mcts_tree.curr_node.candidates)
+		# print(self.mcts_tree.phase)
+
 
 		if self.mcts_tree.phase == 'rollout':
 			# Need to get to leaf before we dive
@@ -405,17 +439,40 @@ class PolicyBranching(scip.Branchrule):
 			if self.model.getStatus() == 'unknown':
 				# Branching n times before solving LP
 				for i in range(self.mcts_tree.branches_per_lp_solve):
-					# print(i)
+					# print(start_var)
 					if start_var:
+						# print(self.mcts_tree.curr_node.child_ucb)
+						# print(self.mcts_tree.curr_node.candidates)
+						# print(max(self.mcts_tree.curr_node.child_ucb))
+						# print(self.mcts_tree.curr_node.child_ucb.tolist().index(max(self.mcts_tree.curr_node.child_ucb)))
+						# print(self.mcts_tree.curr_node.candidates[self.mcts_tree.curr_node.child_ucb.tolist().index(max(self.mcts_tree.curr_node.child_ucb))])
+						# print("END")
 						cand, direction, node_ind = self.mcts_tree.curr_node.choose_candidate()
+
+						cand = self.find_obj_by_attr(candidate_vars, cand)
+
+						if cand is None:
+							print("CAND NOT FOUND IN CAND VARS")
+
 						self.mcts_tree.rollout_parent_index.append(node_ind)
-						self.mcts_tree.rollout_node_cands.append(candidate_vars)
+						self.mcts_tree.rollout_node_cands.append([x.name for x in candidate_vars])
 						self.mcts_tree.curr_node = Node(self.mcts_tree.curr_node, cand, node_ind, direction)
 					else:
 						cand = candidate_vars[i]
 					
+					# print("")
+					# print(self.mcts_tree.curr_node.candidates)
+					# print(candidate_vars)
+					# print(cand)
+					# print("")
+					# for att in dir(cand):
+					# 	print(att)
+					# 	print(getattr(cand,att))
+					# print(cand.__dir__())
 					# print(cand in candidate_vars)
-
+					# print(candidate_vars[0])
+					# print(dir(cand))
+					# print(cand.getLbLocal())
 					lb = cand.getLbLocal()
 					ub = cand.getUbLocal()
 					# print(dir(cand))
@@ -466,7 +523,10 @@ class PolicyBranching(scip.Branchrule):
 
 
 
-def tree_search(tree, instance_file):
+
+
+
+def tree_search(tree, instance_file, return_dict):
 	'''
 	Performs MCTS with time limit (seconds)
 	'''
@@ -477,7 +537,7 @@ def tree_search(tree, instance_file):
 	# print(dir(m))
 	# print(a)
 
-	graph_sols = True
+	graph_sols = False
 	graph_root_ucb = False
 
 	# GRAPHING
@@ -490,10 +550,15 @@ def tree_search(tree, instance_file):
 		plt.xlabel("UCB value")
 		plt.ylabel("Root candidate")		
 
+	start = time.time()
+	nb_dives = 0
+
 	while True:
 		# Rollout + dive
 		m.optimize()
 		# print("OPTIMIZED")
+
+		# print(m.getStatus())
 
 		# print(dir(m))
 
@@ -523,33 +588,59 @@ def tree_search(tree, instance_file):
 			if sol < tree.curr_best_sol:
 				# Add sol and brancher nb to list for graph
 				tree.best_sol_list.append(sol)
-				tree.nb_dom_ch_list.append(tree.ndomchgs)
+				tree.nb_lp_solves.append(tree.ndomchgs)
 
 				tree.curr_best_sol = sol
+
+				tree.update_graph = True
 		else:
+			tree.increment_to_root(node=tree.curr_node, sol=sol)
+
+			m.freeProb()
+
+			m.readProblem(f"{instance_file}")
+
+			utilities.init_scip_params(m, seed=seed, heuristics=False, presolving=False, separating=False, conflict=False)
+
+			m.setIntParam('timing/clocktype', 1)  # 1: CPU user seconds, 2: wall clock time
+			m.setRealParam('limits/time', time_limit)
+			
+			tree.phase = 'rollout'
+
+			tree.curr_node = tree.nodes[0]
+
 			print("NOT OPTIMAL")
+			continue
 
 
 		# GRAPHING SOL VS DOM CHANGES
 		if graph_sols: 
-			if tree.ndomchgs_graph > 500:
-				plt.plot(tree.nb_dom_ch_list, tree.best_sol_list, 'red')
+			if tree.ndomchgs_graph > 500 and tree.update_graph:
+				plt.plot(tree.nb_lp_solves, tree.best_sol_list, 'red')
 				plt.draw()
 				plt.pause(0.001)
+
+				tree.update_graph = False
 
 				tree.ndomchgs_graph = 0
+
 		# GRAPHING ROOT CHILD UCB
 		elif graph_root_ucb:
-			if random.random() > 0.001:
-				plt.bar(list(range(len(tree.nodes[0].child_ucb))), tree.nodes[0].child_ucb, color='red')
+			if random.random() < 0.01:
+				plt.bar(list(range(len(tree.nodes[0].child_ucb[:25]))), tree.nodes[0].child_ucb[:25], color='red')
 				plt.draw()
+				plt.title(f"{nb_dives} dives")
+				plt.ylim(min(tree.nodes[0].child_ucb),max(tree.nodes[0].child_ucb))
 				plt.pause(0.001)
-
-
-		# print("NB BRANCHES",tree.ndomchgs_graph)
 
 		# Increment nb of runs
 		tree.increment_to_root(node=tree.curr_node, sol=sol)
+
+		# print(tree.nodes[0].child_ucb[:20])
+		# print(tree.nodes[0].child_nb_visits[:20])
+		# print(tree.nodes[0].child_nb_wins[:20])
+		# print("")
+
 
 		tree.phase = 'rollout'
 
@@ -578,6 +669,10 @@ def tree_search(tree, instance_file):
 			tree.rollout_tree_nodes = []
 			tree.rollout_parent_index = []
 
+			nb_dives += 4
+
+			print(f"AV TIME PER DIVE: {(time.time() - start)/nb_dives}, {nb_dives} dives\n")
+
 		else:
 			tree.rollout_nb += 1
 		
@@ -585,8 +680,9 @@ def tree_search(tree, instance_file):
 
 		# m.freeTransform()
 
+		faulthandler.enable()
+
 		# Restart problem
-		start = time.time()
 		m.freeProb()
 
 		m.readProblem(f"{instance_file}")
@@ -596,14 +692,18 @@ def tree_search(tree, instance_file):
 		m.setIntParam('timing/clocktype', 1)  # 1: CPU user seconds, 2: wall clock time
 		m.setRealParam('limits/time', time_limit)
 
-		end = time.time()
 		# print(f"RESTART TIME: {end-start}")
 
 		# m.freeSol(m.getSols()[0])
 		# print("RESET MODEL")
 
+		# print(tree.nodes[0])
+		# print(tree.nodes[0].candidates)
+
 		tree.curr_node = tree.nodes[0]
 
+		return_dict['feas_sols_graph'], return_dict['np_lp_solves_graph'] = tree.get_graph_vals()
+		return_dict['root_child_ucb'] = tree.get_root_ucb()
 
 
 
@@ -611,8 +711,9 @@ def tree_search(tree, instance_file):
 if __name__ == '__main__':
 	instance_file = sys.argv[1]
 	seed = 1
-	time_limit = 1200
+	time_limit = 300
 	episode = 1
+	exp_ratio = np.sqrt(2)
 
 	# result_file = f"{args.problem}_{time.strftime('%Y%m%d-%H%M%S')}.csv"
 	instances = [{'path':instance_file,'type':'setcover'}]
@@ -622,7 +723,7 @@ if __name__ == '__main__':
 	policy = branching_policies[0]
 
 	brancher = PolicyBranching(policy)
-	mcts_tree = Tree(branching_policies[0]['seed'], brancher)
+	mcts_tree = Tree(branching_policies[0]['seed'], brancher, branches_per_lp_solve=4, exp_ratio=exp_ratio)
 	
 	brancher.add_tree(mcts_tree)
 
@@ -646,14 +747,24 @@ if __name__ == '__main__':
 	# print(dir(m))
 	# m.printVersion()
 
-	
+	sys.setrecursionlimit(2097152)
+
+
+	manager = Manager()
+	return_dict = manager.dict()
 
 	# Start 
-	# p = Process(target=tree_search, args=(mcts_tree,))
-	# p.start()
-	# p.join(timeout=time_limit)
+	p = Process(target=tree_search, args=(mcts_tree, instance_file, return_dict))
+	p.start()
+	p.join(timeout=time_limit)
 
-	tree_search(mcts_tree, instance_file)
+	# tree_search(mcts_tree, instance_file)
+	if p.is_alive():
+		p.terminate()
+
+	print(return_dict)
+	print(f"Min:{min(return_dict['root_child_ucb'])}, Max:{max(return_dict['root_child_ucb'])}")
+	print(f"Diff: {max(return_dict['root_child_ucb']) - min(return_dict['root_child_ucb'])}")
 
 	# p.terminate()
 	# print(m.data)
