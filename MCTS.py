@@ -1,8 +1,8 @@
-import pyscipopt as scip
 import utilities
 import math
 import multiprocessing as mp
 import sys
+# sys.path.append("..")
 import numpy as np
 import time
 import re
@@ -12,6 +12,8 @@ import faulthandler
 import matplotlib.pyplot as plt
 from copy import copy, deepcopy
 from scipy import integrate
+import pyscipopt as scip
+from heapq import nsmallest
 
 class Tree():
 	''' 
@@ -38,12 +40,12 @@ class Tree():
 
 		self.branches_per_lp_solve = branches_per_lp_solve
 
-		self.nodes = []
+		self.root_node = None
 
 		# Focus node
 		self.curr_node = None
 
-		# Phase in ['rollout', 'add_node', 'dive']
+		# Phase in ['rollout', 'add_node', 'dive', 'add_root_node']
 		# Starts at dive and since we only have root node and no rollout is needed
 		self.phase = 'add_root_node'
 
@@ -58,11 +60,8 @@ class Tree():
 		self.max_rollout_nb = 4
 
 		self.rollout_sols = np.ones(self.max_rollout_nb) * np.inf
-		self.rollout_scip_nodes = []
 		# Those are the parent of the nodes which hae a dive performed on, since those nodes may not be created
 		self.rollout_tree_nodes = []
-		self.rollout_parent_index = []
-		self.rollout_node_cands = []
 
 		self.best_sol_list = []
 		self.nb_lp_solves = []
@@ -76,20 +75,50 @@ class Tree():
 
 		self.exp_ratio = exp_ratio
 
+		# To change root of tree to not leaf. Only done once
+		self.first_branch = True
+
+		# List of all available nodes
+		self.nodes = []
+
+		self.created_node = False
+
+		self.mt_second_depth = False
+		self.branching_to_add_cands = False
+
 
 	def get_best_sol(self):
 		''' 
 		Returns best solution from tree
 		'''
-		return self.nodes[0].best_lp_sol
+		return self.root_node.best_lp_sol
 
+
+	def update_root(self,node):
+		''' 
+		Adds root node to tree
+		'''
+		self.root_node = node
+
+	def get_root_stats(self):
+		''' 
+		Returns root nb visits and root nb wins
+		'''
+		root = self.get_root()
+		return root.child_nb_wins, root.child_nb_visits
+
+	def get_root(self):
+		'''
+		Returns root node of the tree
+		'''
+		return self.root_node
 
 	def add_all_nodes(self):
 		''' 
 		Adds a new node for each node which had a dive performed on
 		'''
-		for parent, scip_node, node_idx, node_cands in zip(self.rollout_tree_nodes, self.rollout_scip_nodes, self.rollout_parent_index, self.rollout_node_cands):
-			self.add_node(parent, scip_node, node_idx, node_idx%2, node_cands)
+		for node in self.rollout_tree_nodes:
+			self.add_node(node)
 
 	def add_best_node(self):
 		''' 
@@ -98,10 +127,11 @@ class Tree():
 		max_val = min(self.rollout_sols)
 		max_idx = self.rollout_sols.tolist().index(max_val)
 		node = self.rollout_tree_nodes[max_idx]
-		scip_node = self.rollout_scip_nodes[max_idx]
-		node_idx = self.rollout_parent_index[max_idx]
 
-		self.add_node(node, scip_node, node_idx, node_idx%2)
+		# Add node and delete other node objects
+		self.add_node(node)
+		for n in np.delete(np.array(self.rollout_tree_nodes),[max_idx]):
+			del n
 		
 
 	def add_rand_node(self):
@@ -110,28 +140,22 @@ class Tree():
 		'''
 		rand_idx = random.randint(0, self.max_rollout_nb-1)
 		node = self.rollout_tree_nodes[rand_idx]
-		scip_node = self.rollout_scip_nodes[rand_idx]
-		node_idx = self.rollout_parent_index[rand_idx]
 
-		self.add_node(node, scip_node, node_idx, node_idx%2)		
+		# Add node and delete other node objects
+		self.add_node(node)	
+		for n in np.delete(np.array(self.rollout_tree_nodes),[rand_idx]):
+			del n
 
 
-	def add_node(self, parent, scip_node, node_idx, branch_up, cands):
+	def add_node(self, node):
 		'''
 		Adds node as a new leaf of the tree.
+		hot_start: Method for initializing nodes. None if random initialization
 		'''
-		child = Node(parent, scip_node, ind_of_parent=node_idx, branch_up=branch_up)
+		node.parent.set_leaf_node()
 
-		# Parent is no longer leaf when all nodes have been visited
-		if len(parent.child_ucb) == len(parent.children):
-			parent.is_leaf_node = False
-
-		child.set_cands(cands)
-		child.set_ucb_stats()
-
-		parent.children.append(child)
-
-		# self.nodes.append(child)
+		node.parent.add_children(node)
+		self.add_node_to_list(node)
 
 
 	def update_focus_node(self, cand, node_ind):
@@ -168,10 +192,9 @@ class Tree():
 
 		# Only increment if we are not at root
 		if parent_node.parent is not None:
-			increment_to_root(parent_node, wins, sol)
+			self.increment_to_root(parent_node, wins, sol)
 		# If parent is root
 		elif sol is not None:
-
 			parent_node.update_best_sol(sol)
 
 
@@ -186,7 +209,7 @@ class Tree():
 		'''
 		Returns a list of root node ucb stats
 		'''
-		return self.nodes[0].child_ucb
+		return self.root_node.child_ucb
 
 
 	def get_best_dive_sol(self):
@@ -196,6 +219,8 @@ class Tree():
 		'''
 		return min(self.rollout_sols)
 
+	def add_node_to_list(self, new_node):
+		self.nodes.append(new_node)
 
 
 class Node():
@@ -214,9 +239,11 @@ class Node():
 	branch_up: Int or None
 		Wether node is branched up (0) or down (1)
 		None when at root
+	init_stats_up and init_stats_down: List or None
+		List of stats which will be used as hot start of UCB stats
 	'''
 
-	def __init__(self, parent, scip_node = None, ind_of_parent=None, branch_up=None):
+	def __init__(self, parent, scip_name = None, ind_of_parent=None, branch_up=None, init_stats_up = None, init_stats_down = None, cost_up=None, cost_down=None):
 
 		self.parent = parent
 
@@ -225,7 +252,7 @@ class Node():
 		self.cand_visits = None
 		self.cand_wins = None
 
-		self.scip_node = scip_node
+		self.scip_name = scip_name
 
 		# Node is associated with left (down) branching
 		self.branch_up = branch_up
@@ -252,6 +279,16 @@ class Node():
 		self.ind_of_parent = ind_of_parent
 
 		self.children = []
+		# Before we add node (only useful if > 1 rollout before adding node)
+		self.temp_children = []
+
+		self.init_stats_up = init_stats_up
+		self.init_stats_down = init_stats_down
+
+		if self.parent is None:
+			self.depth = 0
+		else:
+			self.depth = self.parent.depth + 1
 
 
 	def get_parent(self):
@@ -261,11 +298,18 @@ class Node():
 		return self.parent
 
 
+	def set_leaf_node(self, leaf_bool=False):
+		'''
+		Changes value of leaf node attribute
+		'''
+		self.leaf_node = leaf_bool
+
+
 	def get_best_sol(self):
 		'''
 		Gets best feasible solution
 		'''
-		return nodes[0].best_lp_sol
+		return self.root_node.best_lp_sol
 
 
 	def update_ucb(self, exp_ratio=np.sqrt(2)):
@@ -280,7 +324,11 @@ class Node():
 								exp_ratio * np.sqrt(np.log(self.nb_visits)/self.child_nb_visits)
 
 
-	def set_ucb_stats(self):
+	def add_children(self, child):
+		self.children.append(child)
+
+
+	def set_ucb_stats(self, ucb_stats=None):
 		'''
 		Initialize nb visit, nb wins, ucb stats.
 		Not in __init__ function since we don't have candidates at the start
@@ -289,8 +337,14 @@ class Node():
 		self.child_nb_visits = np.ones(len(self.candidates)) * 1e-8
 		self.child_nb_wins = np.zeros(len(self.candidates))
 
-		# Initializes to all infinity
-		self.child_ucb = np.ones(len(self.child_nb_wins)) * np.inf
+		if ucb_stats is None:
+			# Initializes to all infinity if 
+			if self.init_stats_down is None or (all(self.init_stats_down == 1) and all(self.init_stats_up == 1)):
+				self.child_ucb = np.ones(len(self.child_nb_wins)) * np.inf
+			else:
+				self.child_ucb = [val for pair in zip(self.init_stats_up, self.init_stats_down) for val in pair]
+		else:
+			self.child_ucb = ucb_stats
 
 
 
@@ -308,10 +362,14 @@ class Node():
 		returns both node, as well as direction as 0 for up, 1 for down, 
 						and the index corresponding to the position of children in the list of the parent's candidate
 		'''
-		max_val = max(self.child_ucb)
-		max_ind = self.child_ucb.tolist().index(max_val)
-		cand = self.candidates[max_ind]
-		direction = max_ind % 2
+		if len(self.child_ucb) == 0:
+			cand, direction, max_ind = (None,None,None)
+		else:
+			max_val = max(self.child_ucb)
+			max_ind = self.child_ucb.tolist().index(max_val)
+
+			cand = self.candidates[max_ind]
+			direction = max_ind % 2
 
 		return cand, direction, max_ind
 
@@ -394,59 +452,132 @@ class PolicyBranching(scip.Branchrule):
 			if x.name == attr:
 				obj = x
 				break
-
 		return obj 
 
+	def find_node_by_name_and_dir(self, obj_list, attr, direction):
+		''' Finds the object which name matches in object list'''
+		obj = None
+		for x in obj_list:
+			if x.scip_name == attr:
+				if x.branch_up == direction:
+					obj = x
+					break
+		return obj 
+
+	def find_closest_least_fract(self, list_, i):
+		min_val = 1.
+		min_idx = 0
+		for v, idx in enumerate(list_):
+			if min(v,1-v) < min_val:
+				min_val = v
+				min_idx = idx
+		return min_idx, min_val
+
+
 	def branchexeclp(self, allowaddcons):
-        # SCIP internal branching rule
+
 		if self.policy_type == 'internal':
 			result = self.model.executeBranchRule(self.policy, allowaddcons)
-		# custom policy branching
+		# MCTS policies
 		else:
-			candidate_vars, *_ = self.model.getPseudoBranchCands()
+			all_vars = self.model.getVars()
+			candidate_vars = self.model.getLPBranchCands()[0]
+			khalil_state = self.model.getKhalilState({}, candidate_vars)
+
+			if self.mcts_tree.created_node and self.mcts_tree.curr_node.parent is not None:
+				self.mcts_tree.curr_node.set_cands([x.name for x in candidate_vars])
+
+				self.mcts_tree.curr_node.set_ucb_stats()
+
+				self.mcts_tree.created_node = False
 
 			if not self.mcts_tree.scip_has_branched:
 				self.mcts_tree.scip_has_branched = True
 
 			if self.mcts_tree.phase == 'add_root_node':
-				self.mcts_tree.root_cands = candidate_vars
 				self.mcts_tree.root_lp_sol = self.model.getObjVal()
 
 				node = Node(None)
 				node.set_cands([x.name for x in candidate_vars])
 				node.set_ucb_stats()
 
+				print(f"CANDIDATE VARS AT ROOT\n{len(candidate_vars)} FRACT VARS AT ROOT \n{candidate_vars}")
+
+
 				self.mcts_tree.curr_node = node
+				print("ROOT NODE:", self.mcts_tree.curr_node)
 
-				self.mcts_tree.nodes.append(node)
+				self.mcts_tree.update_root(node)
 
-				self.mcts_tree.phase = 'dive'
+				self.mcts_tree.phase = 'rollout'
+				result = scip.SCIP_RESULT.REDUCEDDOM
 
-
-			if self.mcts_tree.phase == 'rollout':
+			elif self.mcts_tree.phase == 'rollout':
 				# Need to get to leaf before we dive
-				# Here leaf means the node does not have any dives performed on it
+				# Will only start at false for the first node
 				while not self.mcts_tree.curr_node.is_leaf():
-					cand, direction, node_ind = self.mcts_tree.curr_node.choose_candidate()
-					self.mcts_tree.update_focus_node(cand, node_ind)
+					cand_name, direction, node_ind = self.mcts_tree.curr_node.choose_candidate()
 
-					# Branch scip model
-					if direction == 0:
-						ub = cand.getUbLocal()
-						self.model.tightenVarLb(cand, ub)
+					# If solution is already feasible
+					if cand_name is None:
+						return {'result': scip.SCIP_RESULT.REDUCEDDOM}
+
+					cand_node = self.find_node_by_name_and_dir(mcts_tree.curr_node.children, cand_name, direction)
+
+					# Cand exists
+					if cand_node is not None:
+						self.mcts_tree.mt_second_depth = True
+						cand_scip = self.find_obj_by_attr(all_vars, cand_node.scip_name.replace('t_',''))
+
+						self.mcts_tree.update_focus_node(cand_node, node_ind)
+
+						# Branch scip model
+						if direction == 0:
+							ub = cand_scip.getUbLocal()
+							self.model.tightenVarLb(cand_scip, ub)
+						else:
+							lb = cand_scip.getLbLocal()	
+							self.model.tightenVarUb(cand_scip, lb)
 					else:
-						lb = cand.getLbLocal()	
-						self.model.tightenVarUb(cand, lb)
+						# For second or more level of the tree
+						break
+
+				cand_name, direction, node_ind = self.mcts_tree.curr_node.choose_candidate()
+
+				# If solution is already feasible
+				if cand_name is None:
+					return {'result': scip.SCIP_RESULT.REDUCEDDOM}
+
+				c_up = khalil_state['ps_up']
+				c_down = khalil_state['ps_down']
+
+				cand_scip = self.find_obj_by_attr(all_vars, cand_name.replace('t_',''))
+				
+				# Branch scip model
+				if direction == 0:
+					ub = cand_scip.getUbLocal()
+					self.model.tightenVarLb(cand_scip, ub)
+				else:
+					lb = cand_scip.getLbLocal()	
+					self.model.tightenVarUb(cand_scip, lb)
+
 
 				result = scip.SCIP_RESULT.REDUCEDDOM
 					
 				# Dive when we get to leaf node
 				self.mcts_tree.phase = 'dive'
-				self.mcts_tree.start_var = True					
+
+				c_up = khalil_state['ps_up']
+				c_down = khalil_state['ps_down']
+
+				# Creates Node as new leaf of the tree
+				new_node = Node(self.mcts_tree.curr_node, cand_name, node_ind, direction, cost_up = c_up, cost_down = c_down)
+
+				self.mcts_tree.curr_node = new_node
+				self.mcts_tree.created_node = True
 
 
 			elif self.mcts_tree.phase == 'dive':
-
 				start_var = self.mcts_tree.start_var
 
 				# Diving
@@ -454,37 +585,33 @@ class PolicyBranching(scip.Branchrule):
 				if self.model.getStatus() == 'unknown':
 					# Branching n times before solving LP
 					for i in range(self.mcts_tree.branches_per_lp_solve):
-						if start_var:
-							cand, direction, node_ind = self.mcts_tree.curr_node.choose_candidate()
-
-							cand = self.find_obj_by_attr(candidate_vars, cand)
-
-							if cand is None:
-								print("CAND NOT FOUND IN CAND VARS")
-
-							self.mcts_tree.rollout_parent_index.append(node_ind)
-							self.mcts_tree.rollout_node_cands.append([x.name for x in candidate_vars])
-							self.mcts_tree.curr_node = Node(self.mcts_tree.curr_node, cand, node_ind, direction)
-						else:
-							cand = candidate_vars[i]
-						
-						lb = cand.getLbLocal()
-						ub = cand.getUbLocal()
-
-						if start_var:
-							# Branch up
-							if direction == 0:
-								self.model.tightenVarUb(cand, lb)
+						# Here is the real diving part, as opposed to the 
+						if self.policy_type == 'MCTS_fract_diving':
+							# Making sure we have enough candidates
+							if len(candidate_vars) >= i+1:
+								fract_vals = self.model.getLPBranchCands()[1]
+								fract_vals_std = [x if x < 0.5 else 1.-x for x in fract_vals]
+								min_val = nsmallest(i+1, fract_vals_std)[-1]
+								min_ind = fract_vals_std.index(min_val)
+								# Get candidate and direction to branch on
+								cand_scip = candidate_vars[min_ind]
+								direction = int(fract_vals[min_ind] < 0.5)
 							else:
-								self.model.tightenVarLb(cand, ub)
-							self.mcts_tree.start_var = False
-							start_var = False
+								break
+						elif self.policy_type == 'MCTS_vanilla':
+							cand_scip = candidate_vars[i]
+							direction = int(random.random() > 0.5)
 						else:
-							if random.random() > 0.5:
-								# Change upper or lower bound so that ub == lb
-								self.model.tightenVarLb(cand, ub)
-							else:
-								self.model.tightenVarUb(cand, lb)
+							cand_scip = candidate_vars[i]
+							direction = int(random.random() > 0.5)
+
+						lb = cand_scip.getLbLocal()
+						ub = cand_scip.getUbLocal()
+
+						if direction == 0:
+							self.model.tightenVarUb(cand_scip, lb)
+						else:
+							self.model.tightenVarLb(cand_scip, ub)
 
 					result = scip.SCIP_RESULT.REDUCEDDOM
 
@@ -504,7 +631,6 @@ def primal_integral(nlps, primalbounds, zero_val=0):
 	zero_val : Should use the value of the optimal solution. If not found, use zero ?
 	'''
 	return integrate.simps(np.array(primalbounds)-zero_val, np.array(nlps))
-	
 
 
 def tree_search(tree, instance_file, return_dict):
@@ -530,10 +656,17 @@ def tree_search(tree, instance_file, return_dict):
 	start = time.time()
 	nb_dives = 0
 
+	# Problem with presolving when not freed before starting
+	m.freeProb()
+	m.readProblem(f"{instance_file}")
+
 	# Stopped with thread timeout
+	av_rollout_sols = []
+	all_sols = []
 	while True:
 		# Rollout + dive
 		m.optimize()
+		# m.printStatistics()
 
 		# If already optimized
 		if not tree.scip_has_branched:
@@ -542,14 +675,14 @@ def tree_search(tree, instance_file, return_dict):
 			break
 
 		tree.rollout_tree_nodes.append(tree.curr_node)
-		tree.rollout_scip_nodes.append(tree.curr_node.scip_node)
 
 		# Initiate solution
 		sol = None
 
-		# I feasible, add sol to list
+		# If feasible, add sol to list
 		if m.getStatus() == 'optimal':
 			sol = m.getObjVal()
+			all_sols.append(sol)
 
 			tree.rollout_sols[tree.rollout_nb-1] = sol
 			if sol < tree.curr_best_sol:
@@ -574,7 +707,10 @@ def tree_search(tree, instance_file, return_dict):
 			
 			tree.phase = 'rollout'
 
-			tree.curr_node = tree.nodes[0]
+			if tree.created_node:
+				print("CREATED NODE PROBLEM")
+
+			tree.curr_node = tree.get_root()
 
 			print("NOT OPTIMAL")
 			continue
@@ -593,11 +729,11 @@ def tree_search(tree, instance_file, return_dict):
 
 		# GRAPHING ROOT CHILD UCB
 		elif graph_root_ucb:
-			if random.random() < 0.01:
-				plt.bar(list(range(len(tree.nodes[0].child_ucb[:25]))), tree.nodes[0].child_ucb[:25], color='red')
+			if random.random() < 0.1:
+				plt.bar(list(range(len(tree.root_node.child_ucb[:25]))), tree.root_node.child_ucb[:25], color='red')
 				plt.draw()
 				plt.title(f"{nb_dives} dives")
-				plt.ylim(min(tree.nodes[0].child_ucb),max(tree.nodes[0].child_ucb))
+				plt.ylim(min(tree.root_node.child_ucb),max(tree.root_node.child_ucb))
 				plt.pause(0.001)
 
 		# Increment nb of runs
@@ -617,21 +753,28 @@ def tree_search(tree, instance_file, return_dict):
 				tree.add_rand_node()		
 
 			best_sol = min(tree.rollout_sols)
-			print(tree.rollout_sols, tree.get_best_sol())
+			av_rollout_sol = sum(tree.rollout_sols)/len(tree.rollout_sols)
+			print(f"{tree.rollout_sols}, Best: {tree.get_best_sol()}, Av Sol: {av_rollout_sol}" )
 			best_node = tree.rollout_tree_nodes[tree.rollout_sols.tolist().index(best_sol)]
 			tree.increment_to_root(best_node, wins=True, sol=best_sol)
 
 			# Reset lists
 			tree.rollout_sols = np.ones(tree.max_rollout_nb) * np.inf
-			tree.rollout_scip_nodes = []
 			tree.rollout_tree_nodes = []
-			tree.rollout_parent_index = []
 
-			nb_dives += 4
+			nb_dives += tree.max_rollout_nb
+
+
 
 			print(f"AV TIME PER DIVE: {(time.time() - start)/nb_dives}, {nb_dives} dives\n")
 
+			tree.start_var = False
+			av_rollout_sols.append(av_rollout_sol)
+
 		else:
+			# Only for the first n rollouts
+			if nb_dives < tree.max_rollout_nb:
+				tree.start_var = True
 			tree.rollout_nb += 1
 
 		faulthandler.enable()
@@ -646,31 +789,46 @@ def tree_search(tree, instance_file, return_dict):
 		m.setIntParam('timing/clocktype', 1)  # 1: CPU user seconds, 2: wall clock time
 		m.setRealParam('limits/time', time_limit)
 
-		tree.curr_node = tree.nodes[0]
+		tree.curr_node = tree.get_root()
 
 		return_dict['feas_sols_graph'], return_dict['nb_lp_solves_graph'] = tree.get_graph_vals()
 		return_dict['root_child_ucb'] = tree.get_root_ucb()
+		return_dict['root_nb_wins'], return_dict['root_nb_visits'] = tree.get_root_stats()
+		return_dict['all_feas_sols'] = all_sols
 
 
+def moving_average(a, n=3) :
+    ret = np.cumsum(a, dtype=float)
+    ret[n:] = ret[n:] - ret[:-n]
+    return ret[n - 1:] / n
 
 
 if __name__ == '__main__':
 	instance_file = sys.argv[1]
 	seed = 1
-	time_limit = 30
+	time_limit = 3600
 	episode = 1
-	exp_ratio = np.sqrt(2)
+
+	# HYPER PARAMETERS OF THE MODEL
+	EXP_RATIO = np.sqrt(2)
+	BRANCHES_PER_LO_SOLVE = 1
 
 	instances = [{'path':instance_file,'type':'setcover'}]
 
-	branching_policies = [{'type':'internal','name':'internal','seed':0},
-						  {'type':'MCTS_vanilla','name':'MCTS_vanilla','seed':0},
-						  {'type':'MCTS_hot_start','name':'MCTS_vanilla','seed':0}]
+	branching_policies = [{'type':'internal','name':'internal','seed':0, 'dive_type':None},
+						  {'type':'MCTS_vanilla','name':'MCTS_vanilla','seed':0, 'dive_type':'random'},
+						  {'type':'MCTS_hot_start','name':'MCTS_hot_start','seed':0, 'dive_type':'random'},
+						  {'type':'MCTS_coef_diving','name':'MCTS_coef_diving','seed':0, 'dive_type':'coef'},
+						  {'type':'MCTS_fract_diving','name':'MCTS_fract_diving','seed':0, 'dive_type':'fract'}]
+
+	branching_policies = [{'type':'MCTS_vanilla','name':'MCTS_vanilla','seed':0}]
 
 	# Dict {method_name:[list_of_primal_integral]}
-	agg_integral_stats = {'internal':[],'MCTS_vanilla':[]}
+	# agg_integral_stats = {'internal':[],'MCTS_vanilla':[], 'MCTS_hot_start':[]}
+	agg_integral_stats = {x['type']:[] for x in branching_policies}
+
 	# Same, but each containing the raw info (nb lp solves and feas solutions) 
-	raw_stats = {'internal':[],'MCTS_vanilla':[]}
+	raw_stats = {'internal':[],'MCTS_coef_diving':[], 'MCTS_coef_diving':[]}
 	for instance in instances:
 		for policy in branching_policies:
 			brancher = PolicyBranching(policy)
@@ -689,19 +847,24 @@ if __name__ == '__main__':
 			else:
 				utilities.init_scip_params(m, seed=seed, heuristics=False, presolving=False, separating=False, conflict=False)
 
+			# if policy['type'] == 'MCTS_coef_diving':
+			# 	utilities.disable_all_but_coef(m)
+			# elif policy['type'] == 'MCTS_fract_diving':
+			# 	utilities.disable_all_but_fract(m)
+
 			m.setIntParam('timing/clocktype', 1)  # 1: CPU user seconds, 2: wall clock time
 			m.setRealParam('limits/time', time_limit)
 
 			if policy['type'] == 'internal':
 				m.optimize()
-				# print(f"OBJ VAL:{m.getObjVal()}")
+
 				nlps = [x['nlps'] for x in brancher.solving_stats]
 				primalbounds = [x['primalbound'] for x in brancher.solving_stats]
 				raw_stats['internal'].append((nlps, primalbounds))
 				agg_integral_stats['internal'].append(primal_integral(nlps, primalbounds))
 			else:
 				# MCTS BASED METHOD
-				mcts_tree = Tree(policy['seed'], brancher, branches_per_lp_solve=4, exp_ratio=exp_ratio)
+				mcts_tree = Tree(policy['seed'], brancher, branches_per_lp_solve=BRANCHES_PER_LO_SOLVE, exp_ratio=EXP_RATIO)
 				
 				brancher.add_tree(mcts_tree)
 
@@ -721,6 +884,19 @@ if __name__ == '__main__':
 				p.start()
 				p.join(timeout=time_limit)
 
+				ma_nb = 10
+				ma_vals = moving_average(return_dict['all_feas_sols'], ma_nb)
+				x_axis_ma = [x for x in range(len(return_dict['all_feas_sols'])) if x>(ma_nb-2)]
+
+
+				print(return_dict)
+
+				plt.plot(range(len(return_dict['all_feas_sols'])),return_dict['all_feas_sols'])
+				plt.plot(x_axis_ma, ma_vals)
+				plt.show()
+
+
+
 				if p.is_alive():
 					p.terminate()
 
@@ -728,6 +904,9 @@ if __name__ == '__main__':
 				agg_integral_stats[policy['type']].append(primal_integral(return_dict['nb_lp_solves_graph'], return_dict['feas_sols_graph']))
 
 			m.freeProb()
+
+			print(return_dict)
+
 
 	for i in range(10):print("")
 	print(raw_stats)
