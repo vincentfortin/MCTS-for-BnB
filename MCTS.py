@@ -829,23 +829,18 @@ def tree_search(tree, instance_file, return_dict, time_limit, storing_vals):
 		return_dict['all_feas_sols'] = all_sols
 
 
-def moving_average(a, n=3) :
-    ret = np.cumsum(a, dtype=float)
-    ret[n:] = ret[n:] - ret[:-n]
-    return ret[n - 1:] / n
-
-
 if __name__ == '__main__':
 	instance_file = sys.argv[1]
 	seed = 1
-	time_limit = 3600. / 60
+	time_limit = 3600. * 2
+	time_limit = 30
 	episode = 1
 
 	#################################
 	# HYPER PARAMETERS OF THE MODEL #
 	#################################
 	EXP_RATIO = np.sqrt(2)
-	BRANCHES_PER_LP_SOLVE = 4
+	BRANCHES_PER_LP_SOLVE = 5
 
 	#################################
 	#        STORING OF MODEL       #
@@ -855,7 +850,7 @@ if __name__ == '__main__':
 	store_root_wins = True
 	store_root_visits = True
 	store_every_n = 100
-	filename = 'test'
+	filename = 'sqrt_2_exp_ratio'
 	folder_name = 'data_test'
 	storing_vals = (store_stats, store_root_ucb, store_root_wins, store_root_visits, store_every_n, folder_name, filename)
 
@@ -932,19 +927,18 @@ if __name__ == '__main__':
 				p.join(timeout=time_limit)
 
 				ma_nb = 50
-				ma_vals = moving_average(return_dict['all_feas_sols'], ma_nb)
+				ma_vals = utilities.moving_average(return_dict['all_feas_sols'], ma_nb)
 				x_axis_ma = [x for x in range(len(return_dict['all_feas_sols'])) if x>(ma_nb-2)]
 
 
 				print(return_dict)
 
+				if p.is_alive():
+					p.terminate()
+
 				plt.plot(range(len(return_dict['all_feas_sols'])),return_dict['all_feas_sols'])
 				plt.plot(x_axis_ma, ma_vals)
 				plt.show()
-
-
-				if p.is_alive():
-					p.terminate()
 
 				raw_stats[policy['type']].append((return_dict['nb_lp_solves_graph'], return_dict['feas_sols_graph']))
 				agg_integral_stats[policy['type']].append(primal_integral(return_dict['nb_lp_solves_graph'], return_dict['feas_sols_graph']))

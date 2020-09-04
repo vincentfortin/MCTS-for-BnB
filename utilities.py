@@ -7,6 +7,8 @@ import pyscipopt as scip
 import pickle
 import gzip
 import pandas as pd 
+from scipy import integrate
+
 
 from string import Template
 
@@ -39,7 +41,19 @@ def get_mins_left(time_elapsed, tot_time):
 def log_stats(df, foldername, exp_name, stat_name, start_time):
     filename = f'{foldername}/{exp_name}_{stat_name}_{start_time}.csv'
     df.to_csv(filename)
-    print(f"{filename} written")
+
+
+def moving_average(a, n=3) :
+    ret = np.cumsum(a, dtype=float)
+    ret[n:] = ret[n:] - ret[:-n]
+    return ret[n - 1:] / n
+
+def primal_integral(nlps, primalbounds, zero_val=0):
+    '''
+    Calculates the integral of the primal bound, over the number of lp solves
+    zero_val : Should use the value of the optimal solution. If not found, use zero ?
+    '''
+    return integrate.simps(np.array(primalbounds)-zero_val, np.array(nlps))   
 
 
 def init_scip_params(model, seed, heuristics=True, presolving=True, separating=True, conflict=True):
@@ -266,6 +280,7 @@ def valid_seed(seed):
         raise argparse.ArgumentTypeError(
                 "seed must be any integer between 0 and 2**32 - 1 inclusive")
     return seed
+
 
 
 def compute_extended_variable_features(state, candidates):
