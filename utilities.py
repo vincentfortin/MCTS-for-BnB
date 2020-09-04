@@ -1,9 +1,14 @@
 import datetime
 import numpy as np
+import sys
+# sys.path.append("..")
 import scipy.sparse as sp
 import pyscipopt as scip
 import pickle
 import gzip
+import pandas as pd 
+
+from string import Template
 
 def log(str, logfile=None):
     str = f'[{datetime.datetime.now()}] {str}'
@@ -11,6 +16,30 @@ def log(str, logfile=None):
     if logfile is not None:
         with open(logfile, mode='a') as f:
             print(str, file=f)
+
+class DeltaTemplate(Template):
+    delimiter = "%"
+
+def strfdelta(tdelta, fmt):
+    d = {"D": tdelta.days}
+    hours, rem = divmod(tdelta.seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    d["H"] = '{:02d}'.format(hours)
+    d["M"] = '{:02d}'.format(minutes)
+    d["S"] = '{:02d}'.format(seconds)
+    t = DeltaTemplate(fmt)
+    return t.substitute(**d)
+
+
+def get_mins_left(time_elapsed, tot_time):
+    time_left = tot_time - time_elapsed
+    return strfdelta(datetime.timedelta(seconds=time_left),'%H:%M:%S')
+
+
+def log_stats(df, foldername, exp_name, stat_name, start_time):
+    filename = f'{foldername}/{exp_name}_{stat_name}_{start_time}.csv'
+    df.to_csv(filename)
+    print(f"{filename} written")
 
 
 def init_scip_params(model, seed, heuristics=True, presolving=True, separating=True, conflict=True):
@@ -28,6 +57,8 @@ def init_scip_params(model, seed, heuristics=True, presolving=True, separating=T
     # no restart
     model.setIntParam('presolving/maxrestarts', 0)
 
+    # model.setBoolParam("constraints/countsols/collect", True)
+
     # if asked, disable presolving
     if not presolving:
         model.setIntParam('presolving/maxrounds', 0)
@@ -44,6 +75,18 @@ def init_scip_params(model, seed, heuristics=True, presolving=True, separating=T
     # if asked, disable primal heuristics
     if not heuristics:
         model.setHeuristics(scip.SCIP_PARAMSETTING.OFF)
+    elif heuristics == 'agg':
+        model.setHeuristics(scip.SCIP_PARAMSETTING.AGGRESSIVE)
+
+
+def disable_all_but_coef(model):
+    '''
+    Disables all other heuristics but coefficient diving.
+    Also changes so it does not backtrack and stops when infeasible or feasible sol found
+    '''
+    model.setIntParam('heuristics/coefdiving/priority',100000)
+    model.setBoolParam('heuristics/coefdiving/backtrack',False)
+    model.setIntParam('heuristics/coefdiving/freq',1)
 
 
 def extract_state(model, buffer=None):
@@ -385,3 +428,17 @@ def load_flat_samples(filename, feat_type, label_type, augment_feats, normalize_
         raise ValueError(f"Invalid label type: '{label_type}'")
 
     return cand_states, cand_labels, best_cand_idx
+
+
+def find_obj_by_attr(obj_list, attr):
+    ''' Finds the object which name matches in object list'''
+    obj = None
+    for x in obj_list:
+        if x.name == attr:
+            obj = x
+            break
+
+    return obj
+
+
+
