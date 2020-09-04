@@ -11,9 +11,11 @@ from multiprocessing import Process, Value, Manager
 import faulthandler
 import matplotlib.pyplot as plt
 from copy import copy, deepcopy
-from scipy import integrate
 import pyscipopt as scip
 from heapq import nsmallest
+import pandas as pd
+import os
+import datetime
 
 class Tree():
 	''' 
@@ -596,14 +598,17 @@ class PolicyBranching(scip.Branchrule):
 								# Get candidate and direction to branch on
 								cand_scip = candidate_vars[min_ind]
 								direction = int(fract_vals[min_ind] < 0.5)
-							else:
-								break
+							else:break
 						elif self.policy_type == 'MCTS_vanilla':
-							cand_scip = candidate_vars[i]
-							direction = int(random.random() > 0.5)
+							if len(candidate_vars) >= i+1:
+								cand_scip = candidate_vars[i]
+								direction = int(random.random() > 0.5)
+							else:break
 						else:
-							cand_scip = candidate_vars[i]
-							direction = int(random.random() > 0.5)
+							if len(candidate_vars) >= i+1:
+								cand_scip = candidate_vars[i]
+								direction = int(random.random() > 0.5)
+							else:break
 
 						lb = cand_scip.getLbLocal()
 						ub = cand_scip.getUbLocal()
@@ -625,24 +630,20 @@ class PolicyBranching(scip.Branchrule):
 		return {'result': result}
 
 
-def primal_integral(nlps, primalbounds, zero_val=0):
-	'''
-	Calculates the integral of the primal bound, over the number of lp solves
-	zero_val : Should use the value of the optimal solution. If not found, use zero ?
-	'''
-	return integrate.simps(np.array(primalbounds)-zero_val, np.array(nlps))
 
-
-def tree_search(tree, instance_file, return_dict):
+def tree_search(tree, instance_file, return_dict, time_limit, storing_vals):
 	'''
 	Performs MCTS with time limit (seconds)
 	'''
-
 	global m
+
+	start_time = datetime.datetime.now().strftime("%d.%m.%Y_%H:%M:%S")
 
 	graph_sols = False
 	graph_root_ucb = False
 
+	store_stats, store_root_ucb, store_root_wins, store_root_visits, store_every_n, folder_name, filename = storing_vals
+			
 	# GRAPHING
 	plt.ion()
 	plt.show()
@@ -663,10 +664,27 @@ def tree_search(tree, instance_file, return_dict):
 	# Stopped with thread timeout
 	av_rollout_sols = []
 	all_sols = []
+
+	create_cols = True
+
+	create_dfs = True
+
 	while True:
 		# Rollout + dive
 		m.optimize()
-		# m.printStatistics()
+
+		if create_dfs:
+			if not os.path.exists(folder_name):
+				os.makedirs(folder_name)
+			colnames = tree.get_root().candidates
+			create_dfs = False
+			if store_stats:
+				if store_root_ucb:
+					df_root_ucb = pd.DataFrame(columns=colnames)
+				if store_root_wins:
+					df_root_wins = pd.DataFrame(columns=colnames)
+				if store_root_visits:
+					df_root_visits = pd.DataFrame(columns=colnames)
 
 		# If already optimized
 		if not tree.scip_has_branched:
@@ -741,6 +759,20 @@ def tree_search(tree, instance_file, return_dict):
 
 		tree.phase = 'rollout'
 
+		if nb_dives % store_every_n == 0 : 			
+			if store_stats:
+				if store_root_ucb:
+					df_root_ucb.loc[nb_dives] = pd.Series(tree.get_root_ucb(),index=df_root_ucb.columns)
+					utilities.log_stats(df_root_ucb, folder_name, filename ,'ucb',start_time)
+				if store_root_wins:
+					df_root_wins.loc[nb_dives] = pd.Series(tree.get_root().child_nb_wins,index=df_root_wins.columns)
+					utilities.log_stats(df_root_wins,folder_name, filename ,'wins',start_time)
+				if store_root_visits:
+					df_root_visits.loc[nb_dives] = pd.Series(tree.get_root().child_nb_visits,index=df_root_visits.columns)
+					utilities.log_stats(df_root_visits,folder_name, filename ,'visits',start_time)
+
+		nb_dives += 1		
+
 		# Add new nodes
 		if tree.rollout_nb == tree.max_rollout_nb:
 			tree.rollout_nb = 1
@@ -762,11 +794,9 @@ def tree_search(tree, instance_file, return_dict):
 			tree.rollout_sols = np.ones(tree.max_rollout_nb) * np.inf
 			tree.rollout_tree_nodes = []
 
-			nb_dives += tree.max_rollout_nb
+			time_elapsed = (time.time() - start)
 
-
-
-			print(f"AV TIME PER DIVE: {(time.time() - start)/nb_dives}, {nb_dives} dives\n")
+			print(f"AV TIME PER DIVE: {round((time_elapsed/nb_dives),2)}, {nb_dives} dives, {utilities.get_mins_left(time_elapsed, time_limit)} left\n")
 
 			tree.start_var = False
 			av_rollout_sols.append(av_rollout_sol)
@@ -776,6 +806,8 @@ def tree_search(tree, instance_file, return_dict):
 			if nb_dives < tree.max_rollout_nb:
 				tree.start_var = True
 			tree.rollout_nb += 1
+
+		
 
 		faulthandler.enable()
 
@@ -806,12 +838,27 @@ def moving_average(a, n=3) :
 if __name__ == '__main__':
 	instance_file = sys.argv[1]
 	seed = 1
-	time_limit = 3600
+	time_limit = 3600. / 60
 	episode = 1
 
-	# HYPER PARAMETERS OF THE MODEL
+	#################################
+	# HYPER PARAMETERS OF THE MODEL #
+	#################################
 	EXP_RATIO = np.sqrt(2)
-	BRANCHES_PER_LO_SOLVE = 1
+	BRANCHES_PER_LP_SOLVE = 4
+
+	#################################
+	#        STORING OF MODEL       #
+	#################################
+	store_stats = True
+	store_root_ucb = True
+	store_root_wins = True
+	store_root_visits = True
+	store_every_n = 100
+	filename = 'test'
+	folder_name = 'data_test'
+	storing_vals = (store_stats, store_root_ucb, store_root_wins, store_root_visits, store_every_n, folder_name, filename)
+
 
 	instances = [{'path':instance_file,'type':'setcover'}]
 
@@ -864,7 +911,7 @@ if __name__ == '__main__':
 				agg_integral_stats['internal'].append(primal_integral(nlps, primalbounds))
 			else:
 				# MCTS BASED METHOD
-				mcts_tree = Tree(policy['seed'], brancher, branches_per_lp_solve=BRANCHES_PER_LO_SOLVE, exp_ratio=EXP_RATIO)
+				mcts_tree = Tree(policy['seed'], brancher, branches_per_lp_solve=BRANCHES_PER_LP_SOLVE, exp_ratio=EXP_RATIO)
 				
 				brancher.add_tree(mcts_tree)
 
@@ -880,11 +927,11 @@ if __name__ == '__main__':
 				return_dict = manager.dict()
 
 				# Start 
-				p = Process(target=tree_search, args=(mcts_tree, instance['path'], return_dict))
+				p = Process(target=tree_search, args=(mcts_tree, instance['path'], return_dict, time_limit, storing_vals))
 				p.start()
 				p.join(timeout=time_limit)
 
-				ma_nb = 10
+				ma_nb = 50
 				ma_vals = moving_average(return_dict['all_feas_sols'], ma_nb)
 				x_axis_ma = [x for x in range(len(return_dict['all_feas_sols'])) if x>(ma_nb-2)]
 
@@ -894,7 +941,6 @@ if __name__ == '__main__':
 				plt.plot(range(len(return_dict['all_feas_sols'])),return_dict['all_feas_sols'])
 				plt.plot(x_axis_ma, ma_vals)
 				plt.show()
-
 
 
 				if p.is_alive():
