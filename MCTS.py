@@ -2,7 +2,7 @@ import utilities
 import math
 import multiprocessing as mp
 import sys
-# sys.path.append("..")
+sys.path.insert(1,"PySCIPOpt/src")
 import numpy as np
 import time
 import re
@@ -16,6 +16,7 @@ from heapq import nsmallest
 import pandas as pd
 import os
 import datetime
+import dive_stats_calc as dive_stats
 
 class Tree():
 	''' 
@@ -33,11 +34,10 @@ class Tree():
 		How should new nodes be added
 	'''
 
-	def __init__(self, seed, brancher, adding_new_nodes='all', branches_per_lp_solve=5, exp_ratio=np.sqrt(2) ):
+	def __init__(self, seed, brancher, adding_new_nodes='all', branches_per_lp_solve=5, exp_ratio=np.sqrt(2), hot_start=False, prior_visit_size=5):
 		''' 
 		Only starts with root node.
 		'''
-
 		self.brancher = brancher
 
 		self.branches_per_lp_solve = branches_per_lp_solve
@@ -76,6 +76,8 @@ class Tree():
 		self.update_graph = True
 
 		self.exp_ratio = exp_ratio
+		self.hot_start = hot_start
+		self.prior_visit_size = prior_visit_size
 
 		# To change root of tree to not leaf. Only done once
 		self.first_branch = True
@@ -87,6 +89,11 @@ class Tree():
 
 		self.mt_second_depth = False
 		self.branching_to_add_cands = False
+
+		self.first_lp_solve = True
+
+		# Will be set when first lp solve
+		self.root_vals = None
 
 
 	def get_best_sol(self):
@@ -233,19 +240,22 @@ class Node():
 	---------
 	parent : Node
 		parent of current node, with None root node
-	scip_node: Scip node
-		Scip node associated with MCTS node. 
+	scip_name: String
+		Name of the SCIP node. Storing this insead of SCIP node 
+			because when reseting problem, we wipe nodes
 		None when at root
 	ind_of_parent: int
 		Index of parent's candidates. None if no parent node (root)
 	branch_up: Int or None
 		Wether node is branched up (0) or down (1)
 		None when at root
-	init_stats_up and init_stats_down: List or None
-		List of stats which will be used as hot start of UCB stats
+	hot_start : Bool
+		Weather we initialize stats randomly or using prior info
+	prior_visit_size : Int
+		How many visits we will set when initializing stats 
 	'''
 
-	def __init__(self, parent, scip_name = None, ind_of_parent=None, branch_up=None, init_stats_up = None, init_stats_down = None, cost_up=None, cost_down=None):
+	def __init__(self, parent, scip_name = None, ind_of_parent=None, branch_up=None, hot_start=False, prior_visit_size=5):
 
 		self.parent = parent
 
@@ -284,8 +294,10 @@ class Node():
 		# Before we add node (only useful if > 1 rollout before adding node)
 		self.temp_children = []
 
-		self.init_stats_up = init_stats_up
-		self.init_stats_down = init_stats_down
+		self.hot_start_stats = None
+
+		self.hot_start = hot_start
+		self.prior_visit_size = prior_visit_size
 
 		if self.parent is None:
 			self.depth = 0
@@ -314,6 +326,13 @@ class Node():
 		return self.root_node.best_lp_sol
 
 
+	def set_hot_start_stats(self, hot_start_stats):
+		'''
+		Sets hot start statistics before setting 
+		'''
+		self.hot_start_stats = hot_start_stats
+
+
 	def update_ucb(self, exp_ratio=np.sqrt(2)):
 		'''
 		Calculate upper confidence bound
@@ -325,28 +344,38 @@ class Node():
 			self.child_ucb = (self.child_nb_wins / self.child_nb_visits) + \
 								exp_ratio * np.sqrt(np.log(self.nb_visits)/self.child_nb_visits)
 
-
 	def add_children(self, child):
 		self.children.append(child)
 
 
-	def set_ucb_stats(self, ucb_stats=None):
+	def set_ucb_stats(self, exp_ratio=np.sqrt(2), ucb_stats=None):
 		'''
 		Initialize nb visit, nb wins, ucb stats.
 		Not in __init__ function since we don't have candidates at the start
 		'''
 		# Child stats
-		self.child_nb_visits = np.ones(len(self.candidates)) * 1e-8
-		self.child_nb_wins = np.zeros(len(self.candidates))
+		if self.hot_start:
+			self.child_nb_visits = np.ceil(np.ones(len(self.candidates)) * self.prior_visit_size)
+			self.nb_visits = self.prior_visit_size*len(self.candidates)
+			# print("CHILD VISITS")
+			# print(self.child_nb_visits)
+			# print((1+self.hot_start_stats) * self.child_nb_visits)
+			# print(np.sqrt(np.log(self.prior_visit_size*len(self.candidates))))
+			# print(exp_ratio * np.sqrt(np.log(self.prior_visit_size*len(self.candidates))))
+			self.child_nb_wins = ((1+self.hot_start_stats) * self.child_nb_visits) - (exp_ratio * np.sqrt(np.log(self.nb_visits))*np.sqrt(self.child_nb_visits))
+			# print("CHILD WINS")
+			# print(self.child_nb_wins)
+			# print(1+self.hot_start_stats)
+			self.update_ucb(exp_ratio)
+			# print(self.child_ucb)
+			# print(a)
 
-		if ucb_stats is None:
-			# Initializes to all infinity if 
-			if self.init_stats_down is None or (all(self.init_stats_down == 1) and all(self.init_stats_up == 1)):
-				self.child_ucb = np.ones(len(self.child_nb_wins)) * np.inf
-			else:
-				self.child_ucb = [val for pair in zip(self.init_stats_up, self.init_stats_down) for val in pair]
 		else:
-			self.child_ucb = ucb_stats
+			# Init all as zero
+			# Nb visits is 1e-8 instead of zero to avoid divide by zero
+			self.child_nb_visits = np.ones(len(self.candidates)) * 1e-8
+			self.child_nb_wins = self.child_nb_visits
+			self.child_ucb = np.ones(len(self.candidates)) * np.inf
 
 
 
@@ -477,19 +506,34 @@ class PolicyBranching(scip.Branchrule):
 
 
 	def branchexeclp(self, allowaddcons):
-
+		# print("HERE")
 		if self.policy_type == 'internal':
 			result = self.model.executeBranchRule(self.policy, allowaddcons)
 		# MCTS policies
 		else:
 			all_vars = self.model.getVars()
-			candidate_vars = self.model.getLPBranchCands()[0]
-			khalil_state = self.model.getKhalilState({}, candidate_vars)
+			candidate_vars, lp_vals, *_ = self.model.getLPBranchCands()
+			candidate_names = [x.name for x in candidate_vars]
+			
+			if self.mcts_tree.first_lp_solve:
+				self.mcts_tree.root_vals = (candidate_names,lp_vals)
+				self.mcts_tree.first_lp_solve = False
+
+			if self.mcts_tree.curr_node == self.mcts_tree.get_root():
+				# print(khalil_state['ps_up'])
+				pass
+
+			if mcts_tree.hot_start:
+				diving_state = self.model.getDivingState(candidate_vars)
+				hot_start_stats = dive_stats.get_agg_stats(2*len(candidate_vars), diving_state, candidate_names, lp_vals, self.mcts_tree.root_vals)
+			else:
+				hot_start_stats = None
 
 			if self.mcts_tree.created_node and self.mcts_tree.curr_node.parent is not None:
-				self.mcts_tree.curr_node.set_cands([x.name for x in candidate_vars])
+				self.mcts_tree.curr_node.set_hot_start_stats(hot_start_stats)
+				self.mcts_tree.curr_node.set_cands(candidate_names)
 
-				self.mcts_tree.curr_node.set_ucb_stats()
+				self.mcts_tree.curr_node.set_ucb_stats(exp_ratio=mcts_tree.exp_ratio)
 
 				self.mcts_tree.created_node = False
 
@@ -499,9 +543,17 @@ class PolicyBranching(scip.Branchrule):
 			if self.mcts_tree.phase == 'add_root_node':
 				self.mcts_tree.root_lp_sol = self.model.getObjVal()
 
-				node = Node(None)
+				if mcts_tree.hot_start:
+					diving_state = self.model.getDivingState(candidate_vars)
+					hot_start_stats = dive_stats.get_agg_stats(2*len(candidate_vars), diving_state, candidate_names, lp_vals, self.mcts_tree.root_vals )
+				else:
+					hot_start_stats = None
+
+
+				node = Node(None, prior_visit_size=mcts_tree.prior_visit_size, hot_start=mcts_tree.hot_start)
+				node.set_hot_start_stats(hot_start_stats)
 				node.set_cands([x.name for x in candidate_vars])
-				node.set_ucb_stats()
+				node.set_ucb_stats(exp_ratio=mcts_tree.exp_ratio)
 
 				print(f"CANDIDATE VARS AT ROOT\n{len(candidate_vars)} FRACT VARS AT ROOT \n{candidate_vars}")
 
@@ -550,11 +602,8 @@ class PolicyBranching(scip.Branchrule):
 				if cand_name is None:
 					return {'result': scip.SCIP_RESULT.REDUCEDDOM}
 
-				c_up = khalil_state['ps_up']
-				c_down = khalil_state['ps_down']
-
 				cand_scip = self.find_obj_by_attr(all_vars, cand_name.replace('t_',''))
-				
+
 				# Branch scip model
 				if direction == 0:
 					ub = cand_scip.getUbLocal()
@@ -569,11 +618,9 @@ class PolicyBranching(scip.Branchrule):
 				# Dive when we get to leaf node
 				self.mcts_tree.phase = 'dive'
 
-				c_up = khalil_state['ps_up']
-				c_down = khalil_state['ps_down']
-
 				# Creates Node as new leaf of the tree
-				new_node = Node(self.mcts_tree.curr_node, cand_name, node_ind, direction, cost_up = c_up, cost_down = c_down)
+				new_node = Node(self.mcts_tree.curr_node, cand_name, node_ind, direction,
+					hot_start = mcts_tree.hot_start, prior_visit_size=mcts_tree.prior_visit_size)
 
 				self.mcts_tree.curr_node = new_node
 				self.mcts_tree.created_node = True
@@ -730,7 +777,7 @@ def tree_search(tree, instance_file, return_dict, time_limit, storing_vals):
 
 			tree.curr_node = tree.get_root()
 
-			print("NOT OPTIMAL")
+			# print("NOT OPTIMAL")
 			continue
 
 
@@ -833,7 +880,6 @@ if __name__ == '__main__':
 	instance_file = sys.argv[1]
 	seed = 1
 	time_limit = 3600. * 2
-	time_limit = 30
 	episode = 1
 
 	#################################
@@ -841,6 +887,8 @@ if __name__ == '__main__':
 	#################################
 	EXP_RATIO = np.sqrt(2)
 	BRANCHES_PER_LP_SOLVE = 5
+	PRIOR_VISIT_SIZE = 5
+	HOT_START = True
 
 	#################################
 	#        STORING OF MODEL       #
@@ -877,6 +925,11 @@ if __name__ == '__main__':
 
 			# Model will be initialized
 			m = scip.Model()
+
+			
+			# print(a)
+
+
 			m.setIntParam('display/verblevel', 0)
 
 			m.readProblem(f"{instance['path']}")
@@ -906,7 +959,8 @@ if __name__ == '__main__':
 				agg_integral_stats['internal'].append(primal_integral(nlps, primalbounds))
 			else:
 				# MCTS BASED METHOD
-				mcts_tree = Tree(policy['seed'], brancher, branches_per_lp_solve=BRANCHES_PER_LP_SOLVE, exp_ratio=EXP_RATIO)
+				mcts_tree = Tree(policy['seed'], brancher, branches_per_lp_solve=BRANCHES_PER_LP_SOLVE, 
+					exp_ratio=EXP_RATIO, prior_visit_size=PRIOR_VISIT_SIZE, hot_start=HOT_START)
 				
 				brancher.add_tree(mcts_tree)
 
